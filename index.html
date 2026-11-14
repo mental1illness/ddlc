@@ -1,0 +1,776 @@
+<!doctype html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+    <title>Doki Doki Literature Club!</title>
+    <link rel="icon" type="image/png" href="icon.png">
+    <script>
+      var DEFAULT_GAME_FILENAME = 'game.zip';
+    </script>
+    <style>
+      /* Required for the game canvas to fill the window. */
+      html, body { margin: 0; overscroll-behavior: none; }
+      body { margin: 0; }
+      canvas.emscripten {
+        border: 0px none;
+        background-color: black;
+        width: 100vw;
+        height: 100vh;
+        height: 100dvh; /* mobile browsers: dynamic viewport height */
+        display: block;
+        touch-action: none; /* no scroll/zoom gestures over the game */
+      }
+      /* Functional-only mobile usability: bigger tap targets, no zoom-on-tap. */
+      button { touch-action: manipulation; }
+      #ddlc_controls { position: fixed; top: 8px; right: 8px; }
+      #ddlc_controls .fs-btn { display: none; }
+      @media (pointer: coarse) { #ddlc_controls .fs-btn { display: inline-block; } }
+      #renpy_input_box { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+      #renpy_input_box > div { position: absolute; top: 12%; left: 0; right: 0; text-align: center; padding: 0 16px; color: white; text-shadow: 0 0 4px black; }
+      #renpy_input_field { font-size: 20px; min-width: 220px; }
+      @media (pointer: coarse) {
+        #ddlc_controls { top: auto; bottom: calc(8px + env(safe-area-inset-bottom)); right: auto; left: 50%; transform: translateX(-50%); }
+        #ddlc_controls button { font-size: 18px; padding: 12px 18px; }
+        #renpy_input_field { font-size: 16px; /* iOS: >=16px prevents auto-zoom on focus */ }
+      }
+    </style>
+  </head>
+  <body>
+
+    <!-- Loader (plain) -->
+    <div id="loader_container">
+      <b>Doki Doki Literature Club!</b>
+      <div>Loading game assets into browser memory...</div>
+      <div id="status_text">Downloading package...</div>
+    </div>
+
+    <!-- In-Game Buttons (plain) -->
+    <div id="ddlc_controls">
+      <button onclick="DDLC.openFileManager()">Files</button>
+      <button class="fs-btn" onclick="DDLC.toggleFullscreen()">Fullscreen</button>
+    </div>
+
+    <!-- Hidden Save Import Input -->
+    <input id="ID_SavegamesImport" type="file" onchange="onSavegamesImport(this)" accept="application/zip" hidden>
+
+    <!-- Canvas for Ren'Py -->
+    <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+
+    <!-- File Manager (plain) -->
+    <dialog id="file_manager_modal">
+      <button onclick="DDLC.closeFileManager()">Close</button>
+      <div id="char_grid">
+        <!-- Populated dynamically -->
+      </div>
+      <button onclick="DDLC.restoreAllCharacters()">Restore All Characters</button>
+      <button onclick="document.getElementById('chr_uploader').click()">Upload .chr File</button>
+      <input type="file" id="chr_uploader" hidden onchange="DDLC.handleUploadChr(this)">
+      <ul id="secret_files_list"></ul>
+    </dialog>
+
+    <!-- Saves Menu (plain) -->
+    <dialog id="saves_menu">
+      <button onclick="onSavegamesExport(); DDLC.closeSavesMenu()">Export Saves (.zip)</button>
+      <button onclick="document.getElementById('ID_SavegamesImport').click()">Import Saves (.zip)</button>
+      <button onclick="DDLC.closeSavesMenu()">Close</button>
+    </dialog>
+
+    <script>
+      if (typeof WebAssembly !== 'object') {
+        alert("WebAssembly is required to play DDLC in browser.");
+        throw "No WebAssembly support";
+      }
+
+      // Work-around iframe focus
+      document.getElementById('canvas').addEventListener('mouseenter', function() { window.focus(); });
+      document.getElementById('canvas').addEventListener('click', function() { window.focus(); });
+
+      // Auto-unlock WebAudio on user interaction
+      function unlockAudio() {
+        if (typeof SDL2 !== 'undefined' && SDL2.audioContext && SDL2.audioContext.state === 'suspended') {
+          SDL2.audioContext.resume();
+        }
+      }
+      window.addEventListener('click', unlockAudio, { once: true });
+      window.addEventListener('keydown', unlockAudio, { once: true });
+      window.addEventListener('touchstart', unlockAudio, { once: true });
+    </script>
+
+    <script type="text/javascript">
+      /* Savegame import/export */
+      function onSavegamesImport(input) {
+        if (!input.files || !input.files[0]) return;
+        var reader = new FileReader();
+        reader.onload = function(e) {
+          try { FS.unlink('savegames.zip'); } catch (e) {}
+          FS.writeFile('savegames.zip', new Uint8Array(e.target.result));
+          Module._emSavegamesImport();
+          FS.syncfs(false, function(err) {
+            if (err) {
+              alert("Save import error: " + err.message);
+              return;
+            }
+            if (typeof renpy_exec !== 'function') return;
+            // Rescan save slots from disk.
+            renpy_exec('renpy.loadsave.location.scan()').catch(function() {});
+            // Replace the in-memory persistent object with the imported one,
+            // exactly like a fresh boot would (the normal path merges per-field
+            // with newest-change-wins, which would discard older imported data).
+            var apply =
+              'import os, renpy\n' +
+              'import renpy.persistent as _p\n' +
+              '_sd = renpy.config.savedir\n' +
+              '_newp = None\n' +
+              '_loaded_fn = None\n' +
+              'for _fn in [os.path.join(_sd, "persistent.new"), os.path.join(_sd, "persistent")]:\n' +
+              '    if os.path.exists(_fn):\n' +
+              '        try: _newp = _p.load(_fn)\n' +
+              '        except Exception: _newp = None\n' +
+              '        if _newp is not None:\n' +
+              '            _loaded_fn = _fn\n' +
+              '            break\n' +
+              'if _newp is not None:\n' +
+              '    renpy.game.persistent = _newp\n' +
+              '    renpy.game.preferences = _newp._preferences\n' +
+              '    renpy.store.persistent = _newp\n' +
+              '    renpy.store._preferences = _newp._preferences\n' +
+              '    try: _p.persistent_mtime = os.path.getmtime(_loaded_fn)\n' +
+              '    except Exception: pass\n' +
+              '    renpy.exports.restart_interaction()\n' +
+              '    result = "applied"\n' +
+              'else:\n' +
+              '    result = "no persistent data in zip"\n';
+            renpy_exec(apply).catch(function() {});
+          });
+        };
+        reader.readAsArrayBuffer(input.files[0]);
+        input.value = '';
+      }
+
+      function onSavegamesExport() {
+        if (typeof Module._emSavegamesExport === 'function') {
+          var ret = Module._emSavegamesExport();
+          if (ret) {
+            FSDownload('savegames.zip', 'application/zip');
+          }
+        }
+      }
+
+      function FSDownload(filename, mimetype) {
+        try {
+          var data = FS.readFile(filename);
+          var blob = new Blob([data], { type: mimetype || 'application/octet-stream' });
+          var url = window.URL.createObjectURL(blob);
+          var a = document.createElement('a');
+          a.download = filename.replace(/.*\//, '');
+          a.href = url;
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(function() {
+            window.URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+          }, 1000);
+        } catch(e) {
+          console.error("Download error:", e);
+          alert("Error downloading file: " + filename);
+        }
+      }
+
+      /* DDLC File Manager & Helper API */
+      window.DDLC = {
+        characters: ['monika', 'natsuki', 'sayori', 'yuri'],
+        cachedChrBytes: {},
+
+        openFileManager: function() {
+          DDLC.refreshFileList();
+          document.getElementById('file_manager_modal').showModal();
+        },
+
+        closeFileManager: function() {
+          document.getElementById('file_manager_modal').close();
+        },
+
+        toggleFullscreen: function() {
+          var c = document.getElementById('canvas');
+          if (!document.fullscreenElement) {
+            if (c.requestFullscreen) c.requestFullscreen();
+            else if (c.webkitRequestFullscreen) c.webkitRequestFullscreen();
+          } else {
+            if (document.exitFullscreen) document.exitFullscreen();
+          }
+        },
+
+        openSavesMenu: function() {
+          document.getElementById('saves_menu').showModal();
+        },
+
+        closeSavesMenu: function() {
+          document.getElementById('saves_menu').close();
+        },
+
+        checkFileExists: function(path) {
+          if (typeof FS === 'undefined') return false;
+          try {
+            var lookup = FS.lookupPath(path);
+            return !!lookup && !!lookup.node;
+          } catch(e) {
+            return false;
+          }
+        },
+
+        deleteCharacter: function(charName) {
+          var filename = charName + ".chr";
+          var deleted = false;
+
+          // 1. Delete from Emscripten FS across known paths
+          ['/characters/' + filename, 'characters/' + filename, '/game/characters/' + filename].forEach(function(p) {
+            try {
+              if (typeof FS !== 'undefined' && DDLC.checkFileExists(p)) {
+                FS.unlink(p);
+                deleted = true;
+              }
+            } catch(e) {}
+          });
+
+          // 2. Delete via Ren'Py live Python runtime
+          if (typeof renpy_exec === 'function') {
+            renpy_exec(
+              "import os\n" +
+              "for p in ['characters/" + filename + "', '/characters/" + filename + "', '../characters/" + filename + "']:\n" +
+              "    try: os.remove(p)\n" +
+              "    except Exception: pass\n"
+            ).then(function() {
+              DDLC.refreshFileList();
+            }).catch(function() {
+              DDLC.refreshFileList();
+            });
+          } else {
+            DDLC.refreshFileList();
+          }
+        },
+
+        downloadCharacter: function(charName) {
+          var filename = charName + ".chr";
+          var targetPath = null;
+          ['/characters/' + filename, 'characters/' + filename, '/game/' + filename].forEach(function(p) {
+            if (!targetPath && DDLC.checkFileExists(p)) targetPath = p;
+          });
+
+          if (targetPath) {
+            FSDownload(targetPath, 'application/octet-stream');
+          } else if (DDLC.cachedChrBytes[filename]) {
+            var blob = new Blob([DDLC.cachedChrBytes[filename]], { type: 'application/octet-stream' });
+            var url = window.URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.download = filename;
+            a.href = url;
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(function() {
+              window.URL.revokeObjectURL(url);
+              document.body.removeChild(a);
+            }, 1000);
+          } else {
+            alert(filename + " has been deleted from disk!");
+          }
+        },
+
+        restoreAllCharacters: function() {
+          // Restore via Python
+          if (typeof renpy_exec === 'function') {
+            renpy_exec(
+              "import os, renpy\n" +
+              "try:\n" +
+              "    if not os.path.exists('characters'): os.makedirs('characters')\n" +
+              "except Exception: pass\n" +
+              "try:\n" +
+              "    renpy.store.restore_all_characters()\n" +
+              "except Exception as e: print('restore failed:', e)\n"
+            ).then(function() {
+              // Ensure in FS
+              DDLC.restoreFromCache();
+              DDLC.refreshFileList();
+            }).catch(function(err) {
+              DDLC.restoreFromCache();
+              DDLC.refreshFileList();
+            });
+          } else {
+            DDLC.restoreFromCache();
+            DDLC.refreshFileList();
+          }
+        },
+
+        restoreFromCache: function() {
+          if (typeof FS === 'undefined') return;
+          try {
+            if (!DDLC.checkFileExists('/characters')) {
+              FS.mkdir('/characters');
+            }
+          } catch(e) {}
+
+          DDLC.characters.forEach(function(name) {
+            var fn = name + ".chr";
+            if (DDLC.cachedChrBytes[fn]) {
+              try {
+                FS.writeFile('/characters/' + fn, DDLC.cachedChrBytes[fn]);
+              } catch(e) {}
+            }
+          });
+        },
+
+        handleUploadChr: function(input) {
+          if (!input.files || !input.files[0]) return;
+          var file = input.files[0];
+          var reader = new FileReader();
+          reader.onload = function(e) {
+            var data = new Uint8Array(e.target.result);
+            try {
+              if (!DDLC.checkFileExists('/characters')) FS.mkdir('/characters');
+              FS.writeFile('/characters/' + file.name, data);
+              DDLC.refreshFileList();
+            } catch(err) {
+              alert("Failed to write file: " + err.message);
+            }
+          };
+          reader.readAsArrayBuffer(file);
+          input.value = '';
+        },
+
+        refreshFileList: function() {
+          var grid = document.getElementById('char_grid');
+          grid.innerHTML = '';
+
+          DDLC.characters.forEach(function(c) {
+            var fn = c + ".chr";
+            var exists = DDLC.checkFileExists('/characters/' + fn) || DDLC.checkFileExists('characters/' + fn);
+
+            // Cache bytes while available
+            if (exists && !DDLC.cachedChrBytes[fn]) {
+              try {
+                var p = DDLC.checkFileExists('/characters/' + fn) ? '/characters/' + fn : 'characters/' + fn;
+                DDLC.cachedChrBytes[fn] = FS.readFile(p);
+              } catch(e) {}
+            }
+
+            var row = document.createElement('div');
+            row.innerHTML =
+              '<b>' + c.charAt(0).toUpperCase() + c.slice(1) + '</b> (' + fn + ') ' +
+              (exists ? '<button onclick="DDLC.deleteCharacter(\'' + c + '\')">Delete</button> ' : '') +
+              '<button onclick="DDLC.downloadCharacter(\'' + c + '\')">Download</button>';
+            grid.appendChild(row);
+          });
+
+          // Scan for secret notes
+          var secretList = document.getElementById('secret_files_list');
+          secretList.innerHTML = '';
+          var knownSecrets = ['CAN YOU HEAR ME.txt', 'hxppy thxughts.png', 'iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii.txt', 'have a nice weekend!'];
+
+          knownSecrets.forEach(function(s) {
+            var p = '/' + s;
+            var gp = '/game/' + s;
+            var target = null;
+            if (DDLC.checkFileExists(p)) target = p;
+            else if (DDLC.checkFileExists(gp)) target = gp;
+            else if (DDLC.checkFileExists(s)) target = s;
+
+            if (target) {
+              var li = document.createElement('li');
+              li.innerHTML = s + ' <button onclick="FSDownload(\'' + target + '\')">Download</button>';
+              secretList.appendChild(li);
+            }
+          });
+        }
+      };
+
+      // F11 toggles in-game fullscreen on desktop (browser default stretches).
+      window.addEventListener('keydown', function(e) {
+        if (e.key === 'F11') {
+          e.preventDefault();
+          if (typeof DDLC !== 'undefined' && DDLC.toggleFullscreen) DDLC.toggleFullscreen();
+        }
+      });
+
+      /* Main game extract and run */
+      function gameExtractAndRun() {
+        var start = Date.now();
+        var ret = Module.ccall('PyRun_SimpleString', 'number', ['string'], [
+          "import zipfile, traceback, emscripten\n" +
+          "try:\n" +
+          "    zip_ref = zipfile.ZipFile('game.zip', 'r')\n" +
+          "    zip_ref.extractall('.')\n" +
+          "    zip_ref.close()\n" +
+          "except Exception as e:\n" +
+          "    try: emscripten.run_script('window.__extractError=' + repr(str(e)))\n" +
+          "    except Exception: pass\n" +
+          "    traceback.print_exc()\n" +
+          "    raise\n"
+        ]);
+
+        if (ret !== 0) {
+          var msg = "Error extracting game package.";
+          if (window.__extractError) msg += " " + window.__extractError;
+          Module.setStatus(msg);
+          try { alert(msg); } catch (e) {}
+          return;
+        }
+
+        try { FS.unlink('/game.zip'); } catch(e){}
+        console.log("Extracted assets in " + ((Date.now() - start) / 1000.0) + "s");
+
+        // Cache characters into memory for quick restore
+        setTimeout(function() {
+          DDLC.characters.forEach(function(c) {
+            var fn = c + ".chr";
+            try {
+              if (DDLC.checkFileExists('/characters/' + fn)) {
+                DDLC.cachedChrBytes[fn] = FS.readFile('/characters/' + fn);
+              }
+            } catch(e) {}
+          });
+        }, 500);
+
+        // Hide loader
+        var loader = document.getElementById('loader_container');
+        if (loader) {
+          loader.hidden = true;
+        }
+
+        window.setTimeout(function() {
+          Module.ccall('pyapp_runmain', '', [], [], { async: true });
+        }, 200);
+      }
+
+      /* Module Configuration */
+      var statusText = document.getElementById('status_text');
+
+      var Module = {
+        preRun: [],
+        postRun: [],
+        print: function(text) {
+          console.log("[RenPy stdout]", text);
+        },
+        printErr: function(text) {
+          console.error("[RenPy stderr]", text);
+        },
+        canvas: (function() {
+          var canvas = document.getElementById('canvas');
+          canvas.addEventListener("webglcontextlost", function(e) {
+            alert('WebGL context lost. Please reload the page.');
+            e.preventDefault();
+          }, false);
+          return canvas;
+        })(),
+        setStatus: function(text) {
+          if (!Module.setStatus.last) Module.setStatus.last = { time: Date.now(), text: '' };
+          if (text === Module.setStatus.last.text) return;
+          var m = text.match(/([^(]+)\((\d+(\.\d+)?)\/(\d+)\)/);
+          var now = Date.now();
+          if (m && now - Module.setStatus.last.time < 30) return;
+          Module.setStatus.last.time = now;
+          Module.setStatus.last.text = text;
+
+          if (m) {
+            var cur = parseInt(m[2]);
+            var total = parseInt(m[4]);
+            var pct = Math.round((cur / total) * 100);
+            if (statusText) statusText.innerText = "Downloading game assets: " + pct + "% (" + (cur / (1024*1024)).toFixed(1) + " MB / " + (total / (1024*1024)).toFixed(1) + " MB)";
+          } else {
+            if (statusText && text) statusText.innerText = text;
+          }
+        },
+        totalDependencies: 0,
+        monitorRunDependencies: function(left) {
+          this.totalDependencies = Math.max(this.totalDependencies, left);
+          Module.setStatus(left ? 'Preparing engine components (' + (this.totalDependencies - left) + '/' + this.totalDependencies + ')...' : '');
+        }
+      };
+
+      Module.setStatus('Downloading game assets...');
+      window.onerror = function(event) {
+        if (statusText) statusText.innerText = 'Error: ' + event;
+      };
+    </script>
+
+    <!-- JS entry points called by the Ren'Py web runtime (presplash, progress, input) -->
+    <script type="text/javascript">
+      // Called by renpy/display/presplash.py when the presplash finishes.
+      window.presplashEnd = function() {
+        var loader = document.getElementById('loader_container');
+        if (loader && !loader.hidden) {
+          loader.hidden = true;
+        }
+      };
+
+      // Called by renpy/display/presplash.py with (bytes_done, bytes_total).
+      window.progress = function(done, total) {
+        if (!total) return;
+        var pct = Math.min(100, Math.round((done / total) * 100));
+        var status = document.getElementById('status_text');
+        if (status && pct < 100) status.innerText = 'Loading game data: ' + pct + '%';
+      };
+
+      // Web/mobile text input bridge (driven by renpy WebInput on touch devices).
+      var renpyInputElement = null;
+      var renpyInputWatchdog = null;
+
+      window.endInput = function() {
+        if (renpyInputWatchdog) {
+          clearInterval(renpyInputWatchdog);
+          renpyInputWatchdog = null;
+        }
+        if (renpyInputElement) {
+          renpyInputElement.remove();
+          renpyInputElement = null;
+        }
+        window.inputResult = null;
+      };
+
+      window.startInput = function(prompt, value, allow, exclude, mask) {
+        endInput();
+        var box = document.createElement('div');
+        box.id = 'renpy_input_box';
+        var label = document.createElement('div');
+        label.textContent = prompt || '';
+        var field = document.createElement('input');
+        field.id = 'renpy_input_field';
+        field.type = mask ? 'password' : 'text';
+        field.value = value || '';
+        field.autocomplete = 'off';
+        var done = document.createElement('button');
+        done.textContent = 'OK';
+        var finish = function() {
+          window.inputResult = field.value;
+          field.blur();
+        };
+        field.addEventListener('keydown', function(e) {
+          if (e.key === 'Enter') { e.preventDefault(); finish(); }
+        });
+        done.addEventListener('click', finish);
+        box.appendChild(label);
+        box.appendChild(field);
+        box.appendChild(done);
+        document.body.appendChild(box);
+        renpyInputElement = box;
+        // Watchdog: the engine pings the widget while the input screen is
+        // alive; if pings stop (screen left), close it and drop the keyboard.
+        box.dataset.ping = String(Date.now());
+        renpyInputWatchdog = setInterval(function() {
+          if (!renpyInputElement) {
+            clearInterval(renpyInputWatchdog);
+            renpyInputWatchdog = null;
+            return;
+          }
+          var last = parseFloat(renpyInputElement.dataset.ping) || 0;
+          if (Date.now() - last > 400) {
+            endInput();
+          }
+        }, 200);
+        setTimeout(function() { field.focus(); }, 100); // opens the mobile keyboard
+      };
+
+      // Used by renpy to decide whether to use the DOM input (touch devices).
+      window.isTouchDevice = function() {
+        return (('ontouchstart' in window) || navigator.maxTouchPoints > 0) ? 1 : 0;
+      };
+
+      // Called by renpy/display/core.py for the fullscreen preference.
+      if (typeof window.setFullscreen !== 'function') {
+        window.setFullscreen = function(on) {
+          var c = document.getElementById('canvas');
+          if (on) {
+            if (c.requestFullscreen) c.requestFullscreen();
+            else if (c.webkitRequestFullscreen) c.webkitRequestFullscreen();
+          } else if (document.fullscreenElement) {
+            if (document.exitFullscreen) document.exitFullscreen();
+          }
+        };
+      }
+      window.webglContextRestored = false;
+      window.webglContextLost = false;
+
+      // Called by the GL2 renderer to check the fullscreen state.
+      window.isFullscreen = function() {
+        return !!(document.fullscreenElement || document.webkitFullscreenElement);
+      };
+    </script>
+
+    <script type="text/javascript" src="pythonhome-data.js"></script>
+    <script type="text/javascript" src="pyapp-data.js"></script>
+
+    <!-- Python JS Bridge -->
+    <script type="text/javascript">
+      (function() {
+        let cmd_queue = [];
+        let cur_cmd = undefined;
+
+        function cmd_callback(result) {
+          if (cur_cmd === undefined) return;
+          try {
+            if (result.error !== undefined) {
+              const e = new Error(result.error);
+              e.name = result.name;
+              e.traceback = result.traceback;
+              cur_cmd.reject(e);
+            } else {
+              cur_cmd.resolve(result.data);
+            }
+          } finally {
+            cur_cmd = undefined;
+            send_next_cmd();
+          }
+        }
+
+        function send_next_cmd() {
+          if (cmd_queue.length === 0) return;
+          cur_cmd = cmd_queue.shift();
+          const script_b64 = btoa(unescape(encodeURIComponent(cur_cmd.py_script)));
+          const wrapper = 'import base64, emscripten, json, traceback;\n'
+              + 'try:\n'
+              + '    result = None;\n'
+              + "    exec(base64.b64decode('" + script_b64 + "').decode('utf-8'));\n"
+              + '    result = json.dumps(dict(data=result));\n'
+              + 'except Exception as e:\n'
+              + '    result = json.dumps(dict(error=str(e), name=e.__class__.__name__, traceback=traceback.format_exc()));\n'
+              + "emscripten.run_script('_renpy_cmd_callback(%s)' % (result,));";
+
+          window._renpy_cmd = wrapper;
+        }
+
+        function add_cmd(py_script, resolve, reject) {
+          cmd_queue.push({ py_script: py_script, resolve: resolve, reject: reject });
+          if (cur_cmd === undefined) send_next_cmd();
+        }
+
+        renpy_exec = function(py_script) {
+          return new Promise((resolve, reject) => {
+            add_cmd(py_script, resolve, reject);
+          });
+        };
+
+        _renpy_cmd_callback = cmd_callback;
+        window.loadCache = () => {};
+        window.clearCache = () => {};
+      })();
+    </script>
+
+    <!-- Persistent Storage Setup -->
+    <script type="text/javascript">
+      function create_persistent() {
+        try {
+          FS.mkdir('/home/web_user/.renpy');
+          FS.mount(IDBFS, {}, '/home/web_user/.renpy');
+        } catch(e) {
+          console.log("IDBFS init note:", e.message);
+        }
+        FS.syncfs(true, function(err) {
+          if (err) console.warn("Cannot sync persistent storage:", err.message);
+        });
+      }
+      if (Module['calledRun']) {
+        create_persistent();
+      } else {
+        if (!Module['preRun']) Module['preRun'] = [];
+        Module["preRun"].push(create_persistent);
+      }
+    </script>
+
+    <script type="text/javascript" src="index.js"></script>
+
+    <!-- Game package loader: caches game.zip in the Cache API so repeat
+         launches don't re-download ~75 MB. Validates freshness with ETag,
+         re-downloading only when the package actually changed. -->
+    <script type="text/javascript">
+      var DDLC_CACHE_NAME = 'ddlc-game-v1';
+
+      Module.onRuntimeInitialized = async function() {
+        _GET = {};
+        if (location.search.length > 0) {
+          location.search.substr(1).split("&").forEach(function(item) {
+            _GET[item.split("=")[0]] = item.split("=")[1];
+          });
+        }
+        var url = DEFAULT_GAME_FILENAME;
+        if (_GET["game"]) {
+          if (_GET["game"].match(/^[0-9a-z._-]+$/i)) url = _GET["game"];
+          else throw "Invalid game filename.";
+        }
+        try {
+          var buf = await loadGameWithCache(url);
+          FS.writeFile("game.zip", new Uint8Array(buf), { canOwn: true });
+          gameExtractAndRun();
+        } catch (e) {
+          console.error("Cannot load game package:", e);
+          Module.setStatus("Error loading game package. Maybe the download was blocked, see the JavaScript console for more information.");
+        }
+      };
+
+      async function loadGameWithCache(url) {
+        var cache = null;
+        try { cache = await caches.open(DDLC_CACHE_NAME); } catch (e) {}
+
+        if (cache) {
+          var hit = null;
+          try { hit = await cache.match(url); } catch (e) {}
+          if (hit) {
+            var etag = hit.headers.get('X-DDLC-ETag') || '';
+            var lastMod = hit.headers.get('X-DDLC-Last-Modified') || '';
+            var fresh = false;
+            try {
+              var head = await fetch(url, { method: 'HEAD' });
+              var hEtag = head.headers.get('ETag') || '';
+              var hLast = head.headers.get('Last-Modified') || '';
+              fresh = etag ? (hEtag === etag) : (hLast === lastMod);
+            } catch (e) {
+              fresh = true; // network unavailable: trust the cache
+            }
+            if (fresh) {
+              Module.setStatus("Loading game package from cache...");
+              return hit.arrayBuffer();
+            }
+            console.log("Game package changed on server, re-downloading.");
+          }
+        }
+
+        var resp = await fetch(url);
+        if (!resp.ok) throw new Error("HTTP " + resp.status + " while downloading " + url);
+
+        var chunks = [], loaded = 0;
+        var total = parseInt(resp.headers.get('Content-Length')) || 78932000;
+        var reader = resp.body && resp.body.getReader ? resp.body.getReader() : null;
+        if (reader) {
+          while (true) {
+            var res = await reader.read();
+            if (res.done) break;
+            chunks.push(res.value);
+            loaded += res.value.length;
+            Module.setStatus("Downloading game assets: " + Math.round(loaded * 100 / total) + "% (" + (loaded / 1048576).toFixed(1) + " MB / " + (total / 1048576).toFixed(1) + " MB)");
+          }
+        } else {
+          var ab = await resp.arrayBuffer();
+          chunks.push(new Uint8Array(ab));
+          loaded = ab.byteLength;
+        }
+
+        var buf = new Uint8Array(loaded);
+        var off = 0;
+        for (var i = 0; i < chunks.length; i++) { buf.set(chunks[i], off); off += chunks[i].length; }
+
+        if (cache) {
+          try {
+            var headers = { 'Content-Type': 'application/zip' };
+            var e2 = resp.headers.get('ETag');
+            if (e2) headers['X-DDLC-ETag'] = e2;
+            var l2 = resp.headers.get('Last-Modified');
+            if (l2) headers['X-DDLC-Last-Modified'] = l2;
+            await cache.put(new Request(url), new Response(buf, { headers: headers }));
+          } catch (e) {
+            console.warn("Could not store game package in cache:", e);
+          }
+        }
+        return buf.buffer;
+      }
+    </script>
+  </body>
+</html>
